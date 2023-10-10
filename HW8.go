@@ -1,129 +1,119 @@
-// В Go нет концепции "исключений" в том виде, как в других языках
-// Если команда вызывает панику - рекомендуется использовать обработку ошибок
- 
-// Интерфейс команды и очереди:
+// Микросервис авторизации
 
-go
 package main
 
 import (
-  "fmt"
-  "sync"
-  "time"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "strings"
+    "time"
+
+    "github.com/dgrijalva/jwt-go"
 )
 
-type Command interface {
-  Execute()
-}
+var jwtKey = []byte("your_secret_key")
+var battles = make(map[string][]string)
 
-type CommandQueue struct {
-  commands    []Command
-  mutex       sync.Mutex
-  cond        *sync.Cond
-  stopChannel chan bool
-}
-
-func NewCommandQueue() *CommandQueue {
-  q := &CommandQueue{}
-  q.cond = sync.NewCond(&q.mutex)
-  q.stopChannel = make(chan bool, 1)
-  return q
-}
-
-func (q *CommandQueue) Enqueue(c Command) {
-  q.mutex.Lock()
-  defer q.mutex.Unlock()
-  q.commands = append(q.commands, c)
-  q.cond.Signal()
-}
-
-func (q *CommandQueue) Dequeue() Command {
-  q.mutex.Lock()
-  defer q.mutex.Unlock()
-  for len(q.commands) == 0 && !q.HasStopSignal() {
-    q.cond.Wait()
-  }
-  if len(q.commands) == 0 {
-    return nil
-  }
-  cmd := q.commands[0]
-  q.commands = q.commands[1:]
-  return cmd
-}
-
-func (q *CommandQueue) HasStopSignal() bool {
-  select {
-  case <-q.stopChannel:
-    return true
-  default:
-    return false
-  }
-}
-
-func (q *CommandQueue) SendStopSignal() {
-  q.stopChannel <- true
-}
-
-
-// Реализация выполнения команд в отдельном потоке:
-
-go
-func ExecuteCommands(queue *CommandQueue) {
-  for {
-    cmd := queue.Dequeue()
-    if cmd == nil {
-      return
+func createBattle(w http.ResponseWriter, r *http.Request) {
+    var participants struct {
+        Players []string `json:"players"`
     }
-    cmd.Execute()
-  }
+
+    if err := json.NewDecoder(r.Body).Decode(&participants); err != nil {
+        http.Error(w, "Invalid request payload", http.StatusBadRequest)
+        return
+    }
+
+    battleID := fmt.Sprintf("%d", time.Now().Unix())
+    battles[battleID] = participants.Players
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"battleID": battleID})
 }
 
-// Определение команды для старта и остановки выполнения:
+func getToken(w http.ResponseWriter, r *http.Request) {
+    var request struct {
+        BattleID string `json:"battle_id"`
+        Player   string `json:"player"`
+    }
 
-go
-type StartCommand struct {
-  queue *CommandQueue
-}
+    if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+        http.Error(w, "Invalid request payload", http.StatusBadRequest)
+        return
+    }
 
-func (s *StartCommand) Execute() {
-  go ExecuteCommands(s.queue)
-}
+    players, ok := battles[request.BattleID]
+    if !ok {
+        http.Error(w, "Battle not found", http.StatusNotFound)
+        return
+    }
 
-type HardStopCommand struct {
-  queue *CommandQueue
-}
+    for _, player := range players {
+        if player == request.Player {
+            token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+                "player":   request.Player,
+                "battleID": request.BattleID,
+                "exp":      time.Now().Add(time.Hour * 24).Unix(),
+            })
 
-func (h *HardStopCommand) Execute() {
-  h.queue.SendStopSignal()
-}
+            tokenString, err := token.SignedString(jwtKey)
+            if err != nil {
+                http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+                return
+            }
 
-// Пример использования:
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+            return
+        }
+    }
 
-go
-type PrintCommand struct {
-  message string
-}
-
-func (p *PrintCommand) Execute() {
-  fmt.Println(p.message)
+    http.Error(w, "Player not part of the battle", http.StatusUnauthorized)
 }
 
 func main() {
-  queue := NewCommandQueue()
+    http.HandleFunc("/createBattle", createBattle)
+    http.HandleFunc("/getToken", getToken)
 
-  // Start execution in a separate goroutine
-  startCmd := &StartCommand{queue: queue}
-  startCmd.Execute()
-
-  // Enqueue some commands
-  for i := 0; i < 5; i++ {
-    queue.Enqueue(&PrintCommand{message: fmt.Sprintf("Command %d", i)})
-  }
-
-  // Hard stop after 2 seconds
-  time.Sleep(2 * time.Second)
-  stopCmd := &HardStopCommand{queue: queue}
-  stopCmd.Execute()
-
-  time.Sleep(3 * time.Second) // Just to see the output before the program terminates
+    log.Fatal(http.ListenAndServe(":8080", nil))
 }
+
+// Микросервис проверки JWT
+
+func validateToken(tokenStr string) (string, string, error) {
+    token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+        return jwtKey, nil
+    })
+
+    if err != nil {
+        return "", "", err
+    }
+
+    if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+        player := claims["player"].(string)
+        battleID := claims["battleID"].(string)
+        return player, battleID, nil
+    }
+
+    return "", "", fmt.Errorf("invalid token")
+}
+
+func handleMessage(w http.ResponseWriter, r *http.Request) {
+    authHeader := r.Header.Get("Authorization")
+    tokenStr := strings.TrimPrefix(authHeader, "Bearer")
+
+    player, battleID, err := validateToken(tokenStr)
+    if err != nil {
+        http.Error(w, "Invalid token", http.StatusUnauthorized)
+        return
+    }
+
+    // Обработка сообщения используя player и battleID
+
+    w.Write([]byte("Message processed successfully"))
+}
+
+// In the main function:
+http.HandleFunc("/handleMessage", handleMessage)

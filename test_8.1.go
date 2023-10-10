@@ -1,89 +1,110 @@
-// Тестирование микросервиса: HTTP сервера и JWT аутентификации (создание фиктивных HTTP запросов и обрабатка HTTP ответов,
-// проверяем базовую функциональность каждого эндпоинта, а также правильно ли генерируются JWT токены)
+// Автотесты для функции валидации токена
+// 1. Создания боя
+// 2. Выдача JWT токена 
+// 3. Проверка валидного - не валидного токена 
+  
 package main
 
 import (
-  "bytes"
-  "encoding/json"
-  "github.com/dgrijalva/jwt-go"
-  "net/http"
-  "net/http/httptest"
-  "testing"
-  "time"
+    "bytes"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "testing"
 )
 
-// TestCreateGame tests creating a new game
-func TestCreateGame(t *testing.T) {
-  reqBody := bytes.NewBuffer([]byte(`{"players": ["Alice", "Bob"]}`))
-  req, err := http.NewRequest("POST", "/create-game", reqBody)
-  if err != nil {
-    t.Fatalf("Could not create request: %v", err)
-  }
-  res := httptest.NewRecorder()
-  CreateGame(res, req)
-  if res.Code != http.StatusOK {
-    t.Errorf("Expected status OK; got %v", res.Code)
-  }
-  var response map[string]string
-  if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-    t.Fatalf("Could not decode JSON response: %v", err)
-  }
-  if _, ok := response["game_id"]; !ok {
-    t.Errorf("Expected a game_id in response")
-  }
+// Тест 1 для создания боя
+func TestCreateBattle(t *testing.T) {
+    data := map[string][]string{"players": {"player1", "player2"}}
+    jsonData, err := json.Marshal(data)
+    if err != nil {
+        t.Fatal("Failed to marshal test data")
+    }
+
+    req, err := http.NewRequest("POST", "/createBattle", bytes.NewBuffer(jsonData))
+    if err != nil {
+        t.Fatal("Failed to create request")
+    }
+
+    rr := httptest.NewRecorder()
+    handler := http.HandlerFunc(createBattle)
+
+    handler.ServeHTTP(rr, req)
+
+    if rr.Code != http.StatusOK {
+        t.Fatalf("Expected status OK but got %v", rr.Code)
+    }
+
+    var response map[string]string
+    json.Unmarshal(rr.Body.Bytes(), &response)
+    if _, exists := response["battleID"]; !exists {
+        t.Fatal("Expected battleID in response")
+    }
 }
 
-// TestGetJWT tests obtaining a JWT token
-func TestGetJWT(t *testing.T) {
-  game := Game{
-    ID:       "1",
-    Players:  []string{"Alice", "Bob"},
-    IsActive: true,
-  }
-  mux.Lock()
-  games["1"] = game
-  mux.Unlock()
+// Тест 2 для выдачи JWT токена
+func TestGetToken(t *testing.T) {
+    // Добавим бой в нашу структуру battles для теста
+    battleID := "123456"
+    battles[battleID] = []string{"player1"}
 
-  req, err := http.NewRequest("GET", "/get-jwt?username=Alice&game_id=1", nil)
-  if err != nil {
-    t.Fatalf("Could not create request: %v", err)
-  }
+    data := map[string]string{"battle_id": battleID, "player": "player1"}
+    jsonData, err := json.Marshal(data)
+    if err != nil {
+        t.Fatal("Failed to marshal test data")
+    }
 
-  res := httptest.NewRecorder()
-  GetJWT(res, req)
-  if res.Code != http.StatusOK {
-    t.Errorf("Expected status OK; got %v", res.Code)
-  }
+    req, err := http.NewRequest("POST", "/getToken", bytes.NewBuffer(jsonData))
+    if err != nil {
+        t.Fatal("Failed to create request")
+    }
 
-  var response map[string]string
-  if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-    t.Fatalf("Could not decode JSON response: %v", err)
-  }
-  tokenString, ok := response["token"]
-  if !ok {
-    t.Errorf("Expected a token in response")
-    return
-  }
+    rr := httptest.NewRecorder()
+    handler := http.HandlerFunc(getToken)
 
-  // Parse the token
-  token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-    return jwtKey, nil
-  })
-  if err != nil {
-    t.Fatalf("Could not parse token: %v", err)
-  }
+    handler.ServeHTTP(rr, req)
 
-  claims, ok := token.Claims.(jwt.MapClaims)
-  if !ok || !token.Valid {
-    t.Fatalf("Invalid token claims")
-  }
-  if claims["username"].(string) != "Alice" || claims["game_id"].(string) != "1" {
-    t.Errorf("Invalid claims data")
-  }
+    if rr.Code != http.StatusOK {
+        t.Fatalf("Expected status OK but got %v", rr.Code)
+    }
+
+    var response map[string]string
+    json.Unmarshal(rr.Body.Bytes(), &response)
+    if _, exists := response["token"]; !exists {
+        t.Fatal("Expected token in response")
+    }
 }
 
-func TestMain(m *testing.M) {
-  http.HandleFunc("/create-game", CreateGame)
-  http.HandleFunc("/get-jwt", GetJWT)
-  m.Run()
+
+// Тест 3 для функции валидации токена
+
+func TestValidateToken(t *testing.T) {
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+        "player":   "player1",
+        "battleID": "1234",
+        "exp":      time.Now().Add(time.Hour).Unix(),
+    })
+
+    tokenString, err := token.SignedString(jwtKey)
+    if err != nil {
+        t.Fatal("Failed to sign test token")
+    }
+
+    player, battleID, err := validateToken(tokenString)
+    if err != nil {
+        t.Fatal("Failed to validate token")
+    }
+
+    if player != "player1" || battleID != "1234" {
+        t.Fatalf("Expected player1 and 1234 but got %s and %s", player, battleID)
+    }
 }
+
+func TestValidateTokenWithInvalidToken(t *testing.T) {
+    _, _, err := validateToken("invalid.token.string")
+    if err == nil {
+        t.Fatal("Expected error for invalid token")
+    }
+}
+
+
